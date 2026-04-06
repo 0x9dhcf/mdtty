@@ -24,6 +24,19 @@ constexpr std::string_view k_fence        = "```";
 constexpr std::string_view k_hr_char      = "\xe2\x94\x80"; // U+2500 ─
 constexpr std::string_view k_quote_gutter = "\xe2\x94\x82 "; // U+2502 "│ "
 
+// Table box-drawing characters.
+constexpr std::string_view k_tbl_h  = "\xe2\x94\x80"; // ─
+constexpr std::string_view k_tbl_v  = "\xe2\x94\x82"; // │
+constexpr std::string_view k_tbl_tl = "\xe2\x94\x8c"; // ┌
+constexpr std::string_view k_tbl_tr = "\xe2\x94\x90"; // ┐
+constexpr std::string_view k_tbl_bl = "\xe2\x94\x94"; // └
+constexpr std::string_view k_tbl_br = "\xe2\x94\x98"; // ┘
+constexpr std::string_view k_tbl_td = "\xe2\x94\xac"; // ┬
+constexpr std::string_view k_tbl_tu = "\xe2\x94\xb4"; // ┴
+constexpr std::string_view k_tbl_lj = "\xe2\x94\x9c"; // ├
+constexpr std::string_view k_tbl_rj = "\xe2\x94\xa4"; // ┤
+constexpr std::string_view k_tbl_cr = "\xe2\x94\xbc"; // ┼
+
 constexpr std::array<std::string_view, 3> k_bullets = {
     "\xe2\x80\xa2", // • U+2022
     "\xe2\x97\xa6", // ◦ U+25E6
@@ -104,6 +117,103 @@ int detect_terminal_width() {
   return 80;
 }
 
+/// Returns true if the line looks like a table row (starts with '|').
+bool is_table_line(std::string_view line) {
+  while (!line.empty() && line.front() == ' ') {
+    line.remove_prefix(1);
+  }
+  return !line.empty() && line.front() == '|';
+}
+
+std::string_view trim_cell(std::string_view cell) {
+  while (!cell.empty() && cell.front() == ' ') {
+    cell.remove_prefix(1);
+  }
+  while (!cell.empty() && cell.back() == ' ') {
+    cell.remove_suffix(1);
+  }
+  return cell;
+}
+
+/// Splits a table row on '|', stripping the leading/trailing pipes.
+std::vector<std::string_view> split_table_row(std::string_view line) {
+  line = trim_right(line);
+  if (!line.empty() && line.front() == '|') {
+    line.remove_prefix(1);
+  }
+  if (!line.empty() && line.back() == '|') {
+    line.remove_suffix(1);
+  }
+  std::vector<std::string_view> cells;
+  std::size_t start = 0;
+  for (std::size_t i = 0; i < line.size(); ++i) {
+    if (line[i] == '|') {
+      cells.push_back(trim_cell(line.substr(start, i - start)));
+      start = i + 1;
+    }
+  }
+  cells.push_back(trim_cell(line.substr(start)));
+  return cells;
+}
+
+/// Returns true if the cell content is a valid separator (e.g. "---", ":---:", ":---").
+bool is_separator_cell(std::string_view cell) {
+  if (cell.empty()) {
+    return false;
+  }
+  if (cell.front() == ':') {
+    cell.remove_prefix(1);
+  }
+  if (!cell.empty() && cell.back() == ':') {
+    cell.remove_suffix(1);
+  }
+  if (cell.size() < 1) {
+    return false;
+  }
+  return std::ranges::all_of(cell, [](char c) { return c == '-'; });
+}
+
+/// Computes the visual width of inline markdown text (strips formatting markers).
+std::size_t visual_width(std::string_view text) {
+  std::size_t w = 0;
+  std::size_t i = 0;
+  bool in_code  = false;
+  while (i < text.size()) {
+    char c = text[i];
+    if (in_code) {
+      if (c == '`') {
+        in_code = false;
+        ++i;
+        continue;
+      }
+      ++w;
+      ++i;
+      continue;
+    }
+    if (c == '\\' && i + 1 < text.size()) {
+      ++w;
+      i += 2;
+      continue;
+    }
+    if (c == '`') {
+      in_code = true;
+      ++i;
+      continue;
+    }
+    if ((c == '*' || c == '_') && i + 1 < text.size() && text[i + 1] == c) {
+      i += 2;
+      continue;
+    }
+    if (c == '*' || c == '_') {
+      ++i;
+      continue;
+    }
+    ++w;
+    ++i;
+  }
+  return w;
+}
+
 bool stdout_is_tty() {
 #if defined(_WIN32)
   DWORD mode = 0;
@@ -159,6 +269,7 @@ void Renderer::flush() {
     process_line(line_buf_);
     line_buf_.clear();
   }
+  flush_table();
   if (in_fence_) {
     emit_style(cfg_.reset);
     in_fence_         = false;
@@ -170,9 +281,20 @@ void Renderer::reset() {
   line_buf_.clear();
   in_fence_         = false;
   fence_just_opened_ = false;
+  table_buf_.clear();
 }
 
 void Renderer::process_line(std::string_view line) {
+  // --- Table continuation ---
+  if (!table_buf_.empty() && !in_fence_) {
+    if (is_table_line(line)) {
+      table_buf_.emplace_back(line);
+      return;
+    }
+    flush_table();
+    // Fall through to process current line normally.
+  }
+
   // --- Fenced code block handling ---
   if (in_fence_) {
     if (is_fence_line(line)) {
@@ -293,9 +415,123 @@ void Renderer::process_line(std::string_view line) {
     }
   }
 
+  // --- Table start ---
+  if (is_table_line(line)) {
+    table_buf_.emplace_back(line);
+    return;
+  }
+
   // --- Paragraph ---
   emit_inline(line);
   emit_raw("\n");
+}
+
+void Renderer::flush_table() {
+  if (table_buf_.empty()) {
+    return;
+  }
+
+  // Validate: second row must be a separator (e.g. |---|---|).
+  bool valid = table_buf_.size() >= 2;
+  if (valid) {
+    auto sep_cells = split_table_row(table_buf_[1]);
+    valid = !sep_cells.empty() &&
+            std::ranges::all_of(sep_cells, [](auto c) { return is_separator_cell(c); });
+  }
+
+  if (!valid) {
+    // Not a real table, emit buffered lines as paragraphs.
+    for (auto &row : table_buf_) {
+      emit_inline(row);
+      emit_raw("\n");
+    }
+    table_buf_.clear();
+    return;
+  }
+
+  // Parse rows into cells (skip the separator at index 1).
+  std::vector<std::vector<std::string_view>> rows;
+  std::size_t num_cols = 0;
+  for (std::size_t i = 0; i < table_buf_.size(); ++i) {
+    if (i == 1) {
+      continue;
+    }
+    auto cells = split_table_row(table_buf_[i]);
+    num_cols   = std::max(num_cols, cells.size());
+    rows.push_back(std::move(cells));
+  }
+
+  // Compute column widths from visual (inline-stripped) content.
+  std::vector<std::size_t> widths(num_cols, 0);
+  for (auto &row : rows) {
+    for (std::size_t c = 0; c < row.size(); ++c) {
+      widths[c] = std::max(widths[c], visual_width(row[c]));
+    }
+  }
+  for (auto &w : widths) {
+    w = std::max(w, std::size_t{1});
+  }
+
+  // Helper: emit a horizontal border line.
+  auto emit_border = [&](std::string_view left, std::string_view mid,
+                         std::string_view right) {
+    emit_style(cfg_.table);
+    emit_raw(left);
+    for (std::size_t c = 0; c < num_cols; ++c) {
+      for (std::size_t i = 0; i < widths[c] + 2; ++i) {
+        emit_raw(k_tbl_h);
+      }
+      emit_raw(c + 1 < num_cols ? mid : right);
+    }
+    emit_style(cfg_.reset);
+    emit_raw("\n");
+  };
+
+  // Helper: emit a data row.
+  auto emit_row = [&](std::vector<std::string_view> &row, const char *cell_style) {
+    for (std::size_t c = 0; c < num_cols; ++c) {
+      emit_style(cfg_.table);
+      emit_raw(k_tbl_v);
+      emit_style(cfg_.reset);
+      emit_raw(" ");
+      std::string_view content = c < row.size() ? row[c] : std::string_view{};
+      if (cell_style != nullptr) {
+        emit_style(cell_style);
+      }
+      emit_inline(content);
+      if (cell_style != nullptr) {
+        emit_style(cfg_.reset);
+      }
+      std::size_t vw = visual_width(content);
+      for (std::size_t p = vw; p < widths[c]; ++p) {
+        emit_raw(" ");
+      }
+      emit_raw(" ");
+    }
+    emit_style(cfg_.table);
+    emit_raw(k_tbl_v);
+    emit_style(cfg_.reset);
+    emit_raw("\n");
+  };
+
+  // Top border.
+  emit_border(k_tbl_tl, k_tbl_td, k_tbl_tr);
+
+  // Header row.
+  emit_row(rows[0], cfg_.table_head);
+
+  // Header/body separator.
+  emit_border(k_tbl_lj, k_tbl_cr, k_tbl_rj);
+
+  // Body rows.
+  for (std::size_t r = 1; r < rows.size(); ++r) {
+    emit_row(rows[r], nullptr);
+  }
+
+  // Bottom border.
+  emit_border(k_tbl_bl, k_tbl_tu, k_tbl_br);
+
+  table_buf_.clear();
 }
 
 void Renderer::emit_inline(std::string_view line) {

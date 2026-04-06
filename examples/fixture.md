@@ -130,5 +130,19 @@ A blockquote that contains an escape: > \*literal asterisks\* inside quote.
 
 Escaped hash at line start: \# not a heading.
 
+## Tables
+
+| Language | Typing    | Year |
+| -------- | --------- | ---- |
+| C++      | static    | 1985 |
+| Python   | dynamic   | 1991 |
+| Rust     | **static** | 2015 |
+
+A single-column table:
+
+| Status |
+| ------ |
+| OK     |
+
 End of fixture — if you can read this line in a normal paragraph style, the
 stream survived every span, block, and chunk boundary along the way.

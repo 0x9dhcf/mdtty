@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mdtty {
 
@@ -27,6 +28,8 @@ struct Config {
   const char *quote       = "\033[2m\033[3m";
   const char *reset       = "\033[0m";
   const char *hr          = "\033[2m";
+  const char *table       = "\033[2m";
+  const char *table_head  = "\033[1m";
 
   /// When true, no ANSI escapes are emitted. Auto-enabled in the constructor
   /// if the sink does not target a TTY.
@@ -79,8 +82,10 @@ private:
   bool        in_fence_         = false;
   bool        fence_just_opened_ = false;
   int         cached_width_     = 0;
+  std::vector<std::string> table_buf_;
 
   void process_line(std::string_view line);
+  void flush_table();
   void emit_inline(std::string_view line);
   void emit_raw(std::string_view s);
   void emit_style(const char *code);
