@@ -1,10 +1,10 @@
 #include "mdtty/mdtty.hpp"
 
+#include <array>
 #include <cstdio>
 #include <expected>
 #include <fstream>
 #include <iostream>
-#include <print>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
   if (argc > 1) {
     auto content = slurp(argv[1]);
     if (!content) {
-      std::println(stderr, "mdtty: {}: {}", argv[1], content.error().message());
+      std::fprintf(stderr, "mdtty: %s: %s\n", argv[1], content.error().message().c_str());
       return 1;
     }
     // Stream in small chunks to exercise the line buffer across arbitrary splits.
