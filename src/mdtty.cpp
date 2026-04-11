@@ -6,6 +6,11 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wshadow"
+#include "widechar_width.h"
+#pragma GCC diagnostic pop
+#include <utf8proc.h>
 #include <utility>
 
 #if defined(_WIN32)
@@ -173,31 +178,137 @@ bool is_separator_cell(std::string_view cell) {
   return std::ranges::all_of(cell, [](char c) { return c == '-'; });
 }
 
+/// Returns the column width of \p cp, overriding utf8proc for emoji codepoints
+/// that modern terminals render at width 2 even though their formal Unicode
+/// East_Asian_Width is Neutral. Source: emoji-data.txt's Emoji_Presentation=Yes
+/// property, grouped into broad ranges. Keep this list in sync with promptty.
+/// True if \p cp is an Emoji=Yes / Emoji_Presentation=No codepoint that
+/// terminals nevertheless render at width 2. Unicode classifies these as
+/// "default text presentation," but in practice modern terminals (kitty,
+/// wezterm, ghostty, foot, GNOME Terminal, iTerm2) ignore that and render
+/// them as emoji. This list is the canonical set; keep it in sync with
+/// promptty's copy.
+bool is_text_presentation_wide_emoji(uint32_t cp) {
+  // Sorted by codepoint for readability.
+  switch (cp) {
+  case 0x203C: case 0x2049: case 0x2122: case 0x2139:
+  case 0x2194: case 0x2195: case 0x2196: case 0x2197: case 0x2198: case 0x2199:
+  case 0x21A9: case 0x21AA:
+  case 0x2328: case 0x23CF:
+  case 0x24C2:
+  case 0x25AA: case 0x25AB: case 0x25B6: case 0x25C0:
+  case 0x25FB: case 0x25FC:
+  case 0x2600: case 0x2601: case 0x2602: case 0x2603: case 0x2604:
+  case 0x260E: case 0x2611:
+  case 0x2618: case 0x261D: case 0x2620:
+  case 0x2622: case 0x2623: case 0x2626: case 0x262A:
+  case 0x262E: case 0x262F:
+  case 0x2638: case 0x2639: case 0x263A:
+  case 0x2640: case 0x2642:
+  case 0x265F: case 0x2660: case 0x2663: case 0x2665: case 0x2666: case 0x2668:
+  case 0x267B: case 0x267E:
+  case 0x2692: case 0x2694: case 0x2695: case 0x2696: case 0x2697:
+  case 0x2699: case 0x269B: case 0x269C:
+  case 0x26A0: case 0x26A7:
+  case 0x26B0: case 0x26B1:
+  case 0x26C8: case 0x26CF: case 0x26D1:
+  case 0x26D3: case 0x26E9:
+  case 0x26F0: case 0x26F1: case 0x26F4: case 0x26F7: case 0x26F8: case 0x26F9:
+  case 0x2702: case 0x2708: case 0x2709:
+  case 0x270C: case 0x270D: case 0x270F: case 0x2712:
+  case 0x2714: case 0x2716: case 0x271D: case 0x2721:
+  case 0x2733: case 0x2734: case 0x2744: case 0x2747:
+  case 0x2763: case 0x2764: case 0x27A1:
+  case 0x2934: case 0x2935:
+  case 0x2B05: case 0x2B06: case 0x2B07:
+  case 0x3030: case 0x303D: case 0x3297: case 0x3299:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// Returns the column width of \p cp using the widecharwidth table, which is
+/// generated from the upstream Unicode data files (UnicodeData.txt,
+/// EastAsianWidth.txt, emoji-data.txt). This is the same source modern
+/// terminals (kitty, wezterm, ghostty, foot, GNOME Terminal, iTerm2) use.
+int terminal_charwidth(utf8proc_int32_t cp) {
+  if (cp < 0)
+    return 1;
+  // Default-text emoji that terminals render wide anyway. Checked first
+  // because widecharwidth would otherwise report these as width 1.
+  if (is_text_presentation_wide_emoji(static_cast<uint32_t>(cp)))
+    return 2;
+  int w = widechar_wcwidth(static_cast<uint32_t>(cp));
+  if (w == widechar_combining)
+    return 0;
+  // widened_in_9: Unicode 9 promoted these to wide because of emoji
+  // presentation. Modern terminals render them at width 2.
+  if (w == widechar_widened_in_9)
+    return 2;
+  // Other negative codes (nonprint/ambiguous/private/unassigned) fall back
+  // to width 1: safe default for "printable but we don't know."
+  if (w < 0)
+    return 1;
+  return w;
+}
+
+/// Adds the column width of one codepoint at \p text[i] to \p w, advancing \p i
+/// past the consumed bytes. Handles grapheme clusters via \p prev_cp / \p state
+/// so that combining marks and ZWJ sequences count as a single cluster.
+void add_codepoint_width(std::string_view text, std::size_t &i, std::size_t &w,
+                          utf8proc_int32_t &prev_cp, utf8proc_int32_t &state) {
+  utf8proc_int32_t cp = 0;
+  auto consumed = utf8proc_iterate(
+      reinterpret_cast<const utf8proc_uint8_t *>(text.data() + i),
+      static_cast<utf8proc_ssize_t>(text.size() - i), &cp);
+  if (consumed < 1) {
+    // Malformed byte: skip one and treat as width 1 to stay roughly aligned.
+    ++w;
+    ++i;
+    return;
+  }
+  if (prev_cp != 0 && !utf8proc_grapheme_break_stateful(prev_cp, cp, &state)) {
+    // Continuation of the previous grapheme cluster — width 0.
+  } else {
+    int cw = terminal_charwidth(cp);
+    if (cw > 0)
+      w += static_cast<std::size_t>(cw);
+  }
+  prev_cp = cp;
+  i += static_cast<std::size_t>(consumed);
+}
+
 /// Computes the visual width of inline markdown text (strips formatting markers).
 std::size_t visual_width(std::string_view text) {
   std::size_t w = 0;
   std::size_t i = 0;
-  bool in_code  = false;
+  bool in_code = false;
+  utf8proc_int32_t prev_cp = 0;
+  utf8proc_int32_t state = 0;
   while (i < text.size()) {
     char c = text[i];
     if (in_code) {
       if (c == '`') {
         in_code = false;
         ++i;
+        prev_cp = 0;
+        state = 0;
         continue;
       }
-      ++w;
-      ++i;
+      add_codepoint_width(text, i, w, prev_cp, state);
       continue;
     }
     if (c == '\\' && i + 1 < text.size()) {
-      ++w;
-      i += 2;
+      ++i; // skip the backslash
+      add_codepoint_width(text, i, w, prev_cp, state);
       continue;
     }
     if (c == '`') {
       in_code = true;
       ++i;
+      prev_cp = 0;
+      state = 0;
       continue;
     }
     if ((c == '*' || c == '_') && i + 1 < text.size() && text[i + 1] == c) {
@@ -208,8 +319,7 @@ std::size_t visual_width(std::string_view text) {
       ++i;
       continue;
     }
-    ++w;
-    ++i;
+    add_codepoint_width(text, i, w, prev_cp, state);
   }
   return w;
 }
